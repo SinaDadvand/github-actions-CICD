@@ -1,0 +1,164 @@
+name: "Simple Workflow"
+
+on:
+  push:
+    branches: [deployment/qat]
+  # Added manual workflow dispatch with environment input
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy to'
+        required: true
+        default: 'adt'
+        type: choice
+        options:
+          - adt
+          - spt
+          - prd
+
+jobs:
+  checkout:
+    name: "Checkout Code Job"
+    runs-on: "ubuntu-latest"
+    
+    steps:
+      - name: "Checkout code"
+        uses: actions/checkout@v3
+  hello_world:
+    name: "Hello World Job"
+    runs-on: "ubuntu-latest"
+    needs: checkout
+    
+    steps:
+      - name: "Echo Hello World"
+        run: echo "Hello, World!"
+      
+      - name: "Echo Selected Environment"
+        if: github.event_name == 'workflow_dispatch'
+        run: echo "Selected environment is ${{ github.event.inputs.environment }}"
+
+  request_approval:
+    name: "Request Production Deployment Approval"
+    runs-on: "ubuntu-latest"
+    needs: hello_world
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'prd'
+    outputs:
+      issue_number: ${{ steps.create_issue.outputs.issue_number }}
+    
+    steps:
+      - name: "Create Approval Issue"
+        id: create_issue
+        uses: actions/github-script@v6
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const issueTitle = `Approval Required: Production Deployment - Run #${context.runId}`;
+            const issueBody = `
+            ## Production Deployment Approval Request
+            
+            A workflow is waiting for your approval to deploy to the PRODUCTION environment.
+            
+            ### Details:
+            - Workflow: ${context.workflow}
+            - Run ID: ${context.runId}
+            - Triggered by: ${context.actor}
+            - Ref: ${context.ref}
+            
+            ### Instructions:
+            1. Review the changes being deployed
+            2. Comment "approved" on this issue to approve the deployment
+            3. Comment "rejected" to reject the deployment
+            
+            @skouhi@costco.com
+            `;
+            
+            const issue = await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: issueTitle,
+              body: issueBody,
+              labels: ['deployment', 'approval-required']
+            });
+            
+            console.log(`Issue created: ${issue.data.html_url}`);
+            console.log(`Issue number: ${issue.data.number}`);
+            
+            return { issue_number: issue.data.number };
+
+  wait_for_approval:
+    name: "Wait for Production Approval"
+    runs-on: "ubuntu-latest"
+    needs: request_approval
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'prd'
+    
+    steps:
+      - name: "Wait for Issue Comment"
+        uses: actions/github-script@v6
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const issueNumber = ${{ needs.request_approval.outputs.issue_number }};
+            console.log(`Waiting for approval on issue #${issueNumber}`);
+            
+            let approved = false;
+            let rejected = false;
+            let attempts = 0;
+            const maxAttempts = 30; // Will check for 30 minutes (once per minute)
+            
+            while (!approved && !rejected && attempts < maxAttempts) {
+              const { data: comments } = await github.rest.issues.listComments({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issueNumber
+              });
+              
+              for (const comment of comments) {
+                const lowerComment = comment.body.toLowerCase();
+                if (lowerComment.includes('approved')) {
+                  approved = true;
+                  console.log(`Approval received from ${comment.user.login}`);
+                  break;
+                } else if (lowerComment.includes('rejected')) {
+                  rejected = true;
+                  console.log(`Rejection received from ${comment.user.login}`);
+                  break;
+                }
+              }
+              
+              if (!approved && !rejected) {
+                console.log(`Attempt ${attempts + 1}/${maxAttempts}: Waiting for approval...`);
+                await new Promise(resolve => setTimeout(resolve, 60000)); // Wait 1 minute
+                attempts++;
+              }
+            }
+            
+            // Close the issue now that we have a decision
+            await github.rest.issues.update({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issueNumber,
+              state: 'closed'
+            });
+            
+            if (rejected) {
+              core.setFailed('Deployment was rejected');
+              return;
+            }
+            
+            if (!approved) {
+              core.setFailed('Approval timed out after 30 minutes');
+              return;
+            }
+            
+            console.log('Deployment approved, proceeding...');
+
+  deploy_production:
+    name: "Deploy to Production"
+    runs-on: "ubuntu-latest"
+    needs: wait_for_approval
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'prd'
+    
+    steps:
+      - name: "Deploy to Production"
+        run: echo "deploying in prod"
+
